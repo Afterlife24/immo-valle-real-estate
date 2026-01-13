@@ -1,0 +1,18 @@
+# livekit
+livekit
+livekit.agents
+livekit-api
+livekit-agents[openai, silero, deepgram]
+livekit-plugins-noise-cancellation
+
+# openai
+livekit.plugins.openai
+openai
+
+# utilities
+python-dotenv
+twilio
+silero-vad
+pymongo
+tzdata
+aiohttp
