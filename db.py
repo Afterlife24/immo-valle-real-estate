@@ -45,13 +45,17 @@ try:
 
     # Access the 'inquiries' collection within the 'immo_vallee' database
     inquiries_collection = db["inquiries"]
+    
+    # Store client reference for connection testing
+    _mongo_client = client
+    _mongo_db = db
 
 except (PyMongoError, ValueError) as e:
     # Re-raise, but also log for visibility
     logging.getLogger("realtime_realestate_agent").error(f"Mongo init failed: {e}")
     raise
 
-# ---------- Order Database Driver Class ----------
+# ---------- Inquiry Database Driver Class ----------
 
 class DatabaseDriver:
     def __init__(self):
@@ -59,6 +63,15 @@ class DatabaseDriver:
         self.collection = inquiries_collection
         self.log = logging.getLogger("realtime_realestate_agent")
         self._indexes_created = False
+        
+        # Test database connection on initialization
+        try:
+            # Ping the database to verify connection
+            _mongo_client.admin.command('ping')
+            self.log.info("✅ Database connection verified successfully")
+        except Exception as e:
+            self.log.warning(f"⚠️ Database connection test failed: {e}")
+            # Don't raise - connection might still work, just log the warning
         
         # Don't create indexes here - do it lazily on first use to avoid blocking
     
@@ -76,6 +89,9 @@ class DatabaseDriver:
 
     # Create a new inquiry in the MongoDB collection
     def create_inquiry(self, phone: str, inquiry_type: str, inquiry_data: Dict[str, Any], name: str = None, caller_phone: str = None) -> Optional[dict]:
+        # Log that DB connection is being triggered
+        self.log.info("🔌 Database connection triggered by create_inquiry")
+        
         # Ensure indexes exist (lazy, non-blocking)
         self._ensure_indexes()
         

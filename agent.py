@@ -20,6 +20,17 @@ from livekit.agents import (
 from livekit.plugins import openai, noise_cancellation
 from livekit.plugins.openai import realtime
 
+# Try to import ServerVAD if available, otherwise we'll handle it differently
+try:
+    from livekit.plugins.openai.realtime import ServerVAD
+    HAS_SERVER_VAD = True
+except ImportError:
+    try:
+        from livekit.plugins.openai.realtime.models import ServerVAD
+        HAS_SERVER_VAD = True
+    except ImportError:
+        HAS_SERVER_VAD = False
+
 # --- Local imports
 from db import DatabaseDriver
 from prompts import AGENT_INSTRUCTION, SESSION_INSTRUCTION
@@ -119,27 +130,44 @@ def create_inquiry_tool_factory(agent_instance):
             else:
                 final_phone = phone
 
+            # Ensure inquiry_data is a plain dict
+            if inquiry_data and not isinstance(inquiry_data, dict):
+                if hasattr(inquiry_data, "model_dump"):
+                    inquiry_data = inquiry_data.model_dump()
+                elif hasattr(inquiry_data, "dict"):
+                    inquiry_data = inquiry_data.dict()
+                else:
+                    inquiry_data = dict(inquiry_data) if inquiry_data else {}
+
             # Make database call non-blocking - don't wait for it
             async def save_inquiry_async():
                 try:
                     # 🔍 DEBUG: Agent calling save
                     log.info(f"🔍 DEBUG: Agent save_inquiry_async starting...")
+                    log.info(f"🔍 DEBUG: Triggering database connection...")
                     
                     log.info(f"🔍 DEBUG: Inquiry data: {inquiry_data}")
+                    log.info(f"🔍 DEBUG: Inquiry type: {inquiry_type}")
+                    log.info(f"🔍 DEBUG: Phone: {final_phone}")
                     
-                    # Get database driver (lazy initialization)
+                    # Get database driver (lazy initialization - this triggers DB connection)
+                    log.info("🔍 DEBUG: Getting database driver (will initialize connection if needed)...")
                     driver = get_db_driver()
+                    log.info("🔍 DEBUG: Database driver obtained, calling create_inquiry...")
+                    
                     result = driver.create_inquiry(
-                        final_phone, inquiry_type, inquiry_data, name
+                        final_phone, inquiry_type, inquiry_data, name, agent_instance.caller_phone
                     )
                     
                     log.info(f"🔍 DEBUG: save result: {result is not None}")
                     
                     if result:
                         agent_instance.inquiry_created = True
-                        log.info(f"✅ Inquiry saved to MongoDB")
+                        log.info(f"✅ Inquiry saved to MongoDB with ID: {result.get('_id', 'N/A')}")
+                    else:
+                        log.warning("⚠️ Inquiry save returned None - may have failed")
                 except Exception as e:
-                    log.error(f"Async inquiry save failed: {e}")
+                    log.error(f"❌ Async inquiry save failed: {e}")
                     import traceback
                     log.error(f"🔍 DEBUG: Agent traceback: {traceback.format_exc()}")
             
@@ -191,6 +219,19 @@ class RealEstateAgent(Agent):
             if not phone or phone in ["unknown", "extracted_failed"]:
                 phone = f"call_{int(time.time())}"
             args["phone"] = phone
+            
+            # Ensure inquiry_data is a plain dict, not a Pydantic model
+            if "inquiry_data" in args and args["inquiry_data"]:
+                if hasattr(args["inquiry_data"], "model_dump"):
+                    # It's a Pydantic model, convert to dict
+                    args["inquiry_data"] = args["inquiry_data"].model_dump()
+                elif hasattr(args["inquiry_data"], "dict"):
+                    # Fallback for older Pydantic versions
+                    args["inquiry_data"] = args["inquiry_data"].dict()
+                elif not isinstance(args["inquiry_data"], dict):
+                    # Convert to dict if it's not already
+                    args["inquiry_data"] = dict(args["inquiry_data"])
+            
             tool_call.function.arguments = json.dumps(args)
         return await super()._execute_tool(tool_call, session)
 
@@ -420,18 +461,31 @@ async def entrypoint(ctx: JobContext):
     # 🚀 REALTIME MODEL: Ultra-low latency - STT + LLM + TTS all in one!
     # No separate Deepgram, no separate TTS, no separate LLM
     # Everything happens in real-time with OpenAI's Realtime API
+    
+    # Configure turn detection - use Pydantic model if available, otherwise use dict
+    if HAS_SERVER_VAD:
+        turn_detection_config = ServerVAD(
+            threshold=0.5,
+            prefix_padding_ms=300,
+            silence_duration_ms=500,
+        )
+    else:
+        # Fallback: create a Pydantic model dynamically if ServerVAD not available
+        class ServerVADConfig(BaseModel):
+            type: str = "server_vad"
+            threshold: float = 0.5
+            prefix_padding_ms: int = 300
+            silence_duration_ms: int = 500
+        
+        turn_detection_config = ServerVADConfig()
+    
     realtime_model = realtime.RealtimeModel(
-    api_key=openai_api_key,
-    model="gpt-4o-mini-realtime-preview-2024-12-17",
-    voice="alloy",
-    modalities=["audio", "text"],
-    turn_detection={
-        "type": "server_vad",
-        "threshold": 0.5,
-        "prefix_padding_ms": 300,
-        "silence_duration_ms": 500,
-    },
-)
+        api_key=openai_api_key,
+        model="gpt-4o-mini-realtime-preview-2024-12-17",
+        voice="alloy",
+        modalities=["audio", "text"],
+        turn_detection=turn_detection_config,
+    )
 
 
     # Create Agent with RealtimeModel (no separate STT/TTS/LLM needed)
