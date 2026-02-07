@@ -40,11 +40,11 @@ try:
     
     client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
 
-    # Access the 'immo_vallee' database
-    db = client["immo_vallee"]
+    # Access the 'cornish_diamond_co' database
+    db = client["cornish_diamond_co"]
 
-    # Access the 'inquiries' collection within the 'immo_vallee' database
-    inquiries_collection = db["inquiries"]
+    # Access the 'consultations' collection within the 'cornish_diamond_co' database
+    consultations_collection = db["consultations"]
     
     # Store client reference for connection testing
     _mongo_client = client
@@ -52,16 +52,16 @@ try:
 
 except (PyMongoError, ValueError) as e:
     # Re-raise, but also log for visibility
-    logging.getLogger("realtime_realestate_agent").error(f"Mongo init failed: {e}")
+    logging.getLogger("cornish_diamond_agent").error(f"Mongo init failed: {e}")
     raise
 
-# ---------- Inquiry Database Driver Class ----------
+# ---------- Consultation Database Driver Class ----------
 
 class DatabaseDriver:
     def __init__(self):
         # Initialize the collection reference to use in other methods
-        self.collection = inquiries_collection
-        self.log = logging.getLogger("realtime_realestate_agent")
+        self.collection = consultations_collection
+        self.log = logging.getLogger("cornish_diamond_agent")
         self._indexes_created = False
         
         # Test database connection on initialization
@@ -87,10 +87,10 @@ class DatabaseDriver:
                 # Silently ignore - indexes are optional optimization
                 pass
 
-    # Create a new inquiry in the MongoDB collection
-    def create_inquiry(self, phone: str, inquiry_type: str, inquiry_data: Dict[str, Any], name: str = None, caller_phone: str = None) -> Optional[dict]:
+    # Create a new consultation enquiry in the MongoDB collection
+    def create_consultation(self, phone: str, consultation_type: str, consultation_data: Dict[str, Any], name: str = None, email: str = None, caller_phone: str = None) -> Optional[dict]:
         # Log that DB connection is being triggered
-        self.log.info("🔌 Database connection triggered by create_inquiry")
+        self.log.info("🔌 Database connection triggered by create_consultation")
         
         # Ensure indexes exist (lazy, non-blocking)
         self._ensure_indexes()
@@ -106,12 +106,12 @@ class DatabaseDriver:
             phone = f"call_{int(time.time())}"
             self.log.info(f"Database: Replaced 'unknown' with fallback phone: {phone}")
         
-        self.log.info(f"Database: Final phone number for inquiry: {phone}")
+        self.log.info(f"Database: Final phone number for consultation: {phone}")
         
-        inquiry = {
+        consultation = {
             "phone": phone,
-            "inquiry_type": inquiry_type,  # "property_search", "sell_property", "estimation", "advice"
-            "inquiry_data": inquiry_data,
+            "consultation_type": consultation_type,  # "jewellery_information", "diamond_consultation", "appointment_enquiry"
+            "consultation_data": consultation_data,
             "status": "new",
             "created_at": datetime.now().isoformat(),
             "source": "phone_call"
@@ -119,35 +119,38 @@ class DatabaseDriver:
         
         # Add optional fields if provided
         if name:
-            inquiry["name"] = name
+            consultation["name"] = name
+        
+        if email:
+            consultation["email"] = email
         
         # Add caller phone number if available
         if caller_phone:
-            inquiry["caller_phone"] = caller_phone
-            inquiry["phone_source"] = "extracted_from_call"
+            consultation["caller_phone"] = caller_phone
+            consultation["phone_source"] = "extracted_from_call"
         else:
-            inquiry["phone_source"] = "provided_by_customer"
+            consultation["phone_source"] = "provided_by_customer"
         
         try:
-            self.log.info(f"Database: Inserting inquiry with phone: {inquiry.get('phone')}")
-            self.log.info(f"Database: Full inquiry document: {inquiry}")
-            # Insert the inquiry document into the MongoDB collection
-            result = self.collection.insert_one(inquiry)
+            self.log.info(f"Database: Inserting consultation with phone: {consultation.get('phone')}")
+            self.log.info(f"Database: Full consultation document: {consultation}")
+            # Insert the consultation document into the MongoDB collection
+            result = self.collection.insert_one(consultation)
             self.log.info(f"Database: Insert result: {result.inserted_id}")
             
-            # Add MongoDB ID to inquiry for reference
-            inquiry["_id"] = str(result.inserted_id)
+            # Add MongoDB ID to consultation for reference
+            consultation["_id"] = str(result.inserted_id)
             
-            return inquiry
+            return consultation
         except PyMongoError as e:
             self.log.error(f"Database: Insert failed: {e}")
             return None
     
-    # Retrieve an inquiry document by phone number
-    def get_inquiry_by_phone(self, phone: str) -> Optional[dict]:
+    # Retrieve a consultation document by phone number
+    def get_consultation_by_phone(self, phone: str) -> Optional[dict]:
         try:
-            # Search for an inquiry with the matching phone number, get the most recent one
-            inquiry = self.collection.find_one({"phone": phone}, sort=[("_id", -1)])
-            return inquiry
+            # Search for a consultation with the matching phone number, get the most recent one
+            consultation = self.collection.find_one({"phone": phone}, sort=[("_id", -1)])
+            return consultation
         except PyMongoError:
             return None

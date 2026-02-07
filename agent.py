@@ -3,8 +3,9 @@ import os
 import asyncio
 import time
 import logging
-from typing import List, Dict, Any
-from pydantic import BaseModel, ConfigDict
+import re
+from typing import List, Dict, Any, Optional
+from pydantic import BaseModel, ConfigDict, ValidationError
 from dotenv import load_dotenv
 from datetime import datetime
 
@@ -20,17 +21,6 @@ from livekit.agents import (
 from livekit.plugins import openai, noise_cancellation
 from livekit.plugins.openai import realtime
 
-# Try to import ServerVAD if available, otherwise we'll handle it differently
-try:
-    from livekit.plugins.openai.realtime import ServerVAD
-    HAS_SERVER_VAD = True
-except ImportError:
-    try:
-        from livekit.plugins.openai.realtime.models import ServerVAD
-        HAS_SERVER_VAD = True
-    except ImportError:
-        HAS_SERVER_VAD = False
-
 # --- Local imports
 from db import DatabaseDriver
 from prompts import AGENT_INSTRUCTION, SESSION_INSTRUCTION
@@ -39,524 +29,629 @@ from prompts import AGENT_INSTRUCTION, SESSION_INSTRUCTION
 load_dotenv()
 
 # ============================================================
-# 🚀 MODULE-LEVEL PROMPT CACHE: Load once, reuse forever
+# 🚀 CONFIGURATION
 # ============================================================
-# Cache combined instructions at module level to avoid any recalculation
-# Prompts are already cached in prompts.py, this ensures combined version is also cached
+PRODUCTION = os.getenv("ENVIRONMENT") == "production"
+
+# --- Environment variables for configurability
+OPENAI_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-mini-realtime-preview-2024-12-17")
+AGENT_VOICE = os.getenv("AGENT_VOICE", "alloy")
+AGENT_NAME = os.getenv("AGENT_NAME", "Sarah")
+COMPANY_NAME = os.getenv("COMPANY_NAME", "The Cornish Diamond Co.")
+
+# --- Minimum confidence threshold for STT
+STT_CONFIDENCE_THRESHOLD = float(os.getenv("STT_CONFIDENCE_THRESHOLD", "0.6"))
+
+# ============================================================
+# 📝 LOGGER SETUP (MUST BE BEFORE ANY LOGGER USAGE)
+# ============================================================
+
+# Configure logging first
+logging.basicConfig(
+    level=logging.WARNING if PRODUCTION else logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
+# Create logger instance
+log = logging.getLogger("jewellery_consultant_agent")
+
+# ============================================================
+# 🛡️ SECURITY & PRIVACY GUARDS
+# ============================================================
+
+def should_process(text: str, confidence: float | None = None) -> bool:
+    """Noise & Intent Guard from checklist - filters irrelevant speech"""
+    if not text or not text.strip():
+        return False
+    
+    text = text.lower().strip()
+    
+    # Minimum length check - discard short fragments
+    if len(text.split()) < 3:
+        return False
+    
+    # Confidence gating
+    if confidence is not None and confidence < STT_CONFIDENCE_THRESHOLD:
+        return False
+    
+    # Intent keyword filtering - only process relevant speech
+    keywords = ["ring", "diamond", "appointment", "consult", "jewellery", 
+                "jewelry", "wedding", "engagement", "band", "gold", "silver",
+                "platinum", "gem", "stone", "carat", "cut", "clarity", "color"]
+    
+    return any(k in text for k in keywords)
+
+
+def sanitize_input(text: str) -> str:
+    """Input sanitization to remove PII and irrelevant content from text"""
+    if not text:
+        return ""
+    
+    # Remove filler words
+    filler_words = ["uh", "um", "hmm", "you know", "like", "actually", "basically"]
+    for word in filler_words:
+        text = text.replace(word, "")
+    
+    # Remove PII patterns (excluding phone numbers which are handled separately)
+    # Email addresses
+    text = re.sub(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', '[REDACTED_EMAIL]', text)
+    # Credit card numbers (simplified pattern)
+    text = re.sub(r'\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}', '[REDACTED_CC]', text)
+    
+    # Limit length
+    return text[:500].strip()
+
+
+def sanitize_phone(phone: str) -> str:
+    """Sanitize phone numbers - keep only digits and plus sign"""
+    if not phone or phone == "unknown":
+        return phone
+    
+    # Keep only digits and plus sign
+    cleaned = re.sub(r"[^\d+]", "", phone)
+    
+    # Limit reasonable length
+    return cleaned[:20] if cleaned else phone
+
+
+# ============================================================
+# 🚀 MODULE-LEVEL PROMPT CACHE
+# ============================================================
 _COMBINED_INSTRUCTIONS_CACHE = None
 
-def _get_combined_instructions():
+def _get_combined_instructions() -> str:
     """Get cached combined instructions - computed once at module load"""
     global _COMBINED_INSTRUCTIONS_CACHE
     if _COMBINED_INSTRUCTIONS_CACHE is None:
-        # AGENT_INSTRUCTION and SESSION_INSTRUCTION are already cached in prompts.py
-        # This is just combining them once and storing in memory
-        _COMBINED_INSTRUCTIONS_CACHE = f"{AGENT_INSTRUCTION}\n\n{SESSION_INSTRUCTION}"
+        # Apply environment variables to instructions
+        base_instructions = f"{AGENT_INSTRUCTION}\n\n{SESSION_INSTRUCTION}"
+        # Replace placeholders
+        base_instructions = base_instructions.replace("{AGENT_NAME}", AGENT_NAME)
+        base_instructions = base_instructions.replace("{COMPANY_NAME}", COMPANY_NAME)
+        _COMBINED_INSTRUCTIONS_CACHE = base_instructions
     return _COMBINED_INSTRUCTIONS_CACHE
 
-# --- Production Mode Configuration
-PRODUCTION = os.getenv("ENVIRONMENT") == "production"
+# ============================================================
+# 🗄️ DATABASE MANAGEMENT
+# ============================================================
 
-# --- Logger with environment-based levels
-log = logging.getLogger("realtime_realestate_agent")
-if PRODUCTION:
-    log.setLevel(logging.WARNING)  # Reduced logging in production for better performance
-    logging.getLogger("livekit").setLevel(logging.ERROR)
-else:
-    log.setLevel(logging.INFO)
+class DatabaseManager:
+    """Thread-safe database manager with connection pooling"""
+    _instance = None
+    _lock = asyncio.Lock()
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(DatabaseManager, cls).__new__(cls)
+            cls._instance._driver = None
+            cls._instance._initialized = False
+        return cls._instance
+    
+    async def initialize(self) -> None:
+        """Initialize database connection with health check"""
+        async with self._lock:
+            if not self._initialized:
+                try:
+                    self._driver = DatabaseDriver()
+                    # Perform health check
+                    if hasattr(self._driver, 'health_check'):
+                        await self._driver.health_check()
+                    else:
+                        # Simple connection test
+                        await asyncio.to_thread(lambda: self._driver.ping() 
+                                                if hasattr(self._driver, 'ping') else None)
+                    self._initialized = True
+                    log.info("✅ Database initialized successfully")
+                except Exception as e:
+                    log.error(f"❌ Database initialization failed: {e}")
+                    raise
+    
+    def get_driver(self):
+        """Get database driver (raises if not initialized)"""
+        if not self._initialized:
+            raise RuntimeError("Database not initialized")
+        return self._driver
 
-# --- Database (lazy initialization to avoid blocking)
-db_driver = None
+# Global database manager instance
+db_manager = DatabaseManager()
 
-def get_db_driver():
-    """Get database driver with lazy initialization"""
-    global db_driver
-    if db_driver is None:
-        db_driver = DatabaseDriver()
-    return db_driver
-
-# ------------------------------------------------------------
+# ============================================================
 # 🧩 FUNCTION TOOLS
-# ------------------------------------------------------------
-current_agent = None
-current_job_context = None
+# ============================================================
 
-class InquiryData(BaseModel):
+class ConsultationData(BaseModel):
     model_config = ConfigDict(extra="allow")
     
     # Common fields
-    inquiry_type: str  # "property_search", "sell_property", "estimation", "advice"
+    consultation_type: str  # "jewellery_information", "diamond_consultation", "appointment_enquiry"
     
-    # Property search fields
-    property_type: str | None = None  # "appartement", "maison", "terrain", etc.
-    location: str | None = None
-    max_budget: float | None = None
-    surface_min: float | None = None
-    rooms: int | None = None
-    features: List[str] | None = None
+    # Jewellery information fields
+    jewellery_category: Optional[str] = None  # "engagement_ring", "wedding_band", "bespoke"
+    style_preference: Optional[str] = None
+    diamond_shape: Optional[str] = None
     
-    # Sell property fields
-    property_condition: str | None = None
+    # Consultation fields
+    occasion: Optional[str] = None  # "engagement", "wedding", "anniversary", "bespoke_gift"
+    ring_style: Optional[str] = None
+    diamond_preference: Optional[str] = None  # "lab_grown", "natural"
+    budget_range: Optional[str] = None
     
-    # Estimation fields
-    estimated_value: float | None = None
+    # Appointment fields
+    consultation_type_preference: Optional[str] = None  # "in_person", "virtual"
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    name: Optional[str] = None
 
 
-class CreateInquiryArgs(BaseModel):
+class TurnDetectionConfig(BaseModel):
+    type: str = "server_vad"
+    threshold: float = 0.5
+    prefix_padding_ms: int = 300
+    silence_duration_ms: int = 500
+
+
+class CreateConsultationArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     
-    inquiry_type: str  # "property_search", "sell_property", "estimation", "advice"
-    inquiry_data: Dict[str, Any]
-    phone: str | None = None
-    name: str | None = None
+    consultation_type: str  # "jewellery_information", "diamond_consultation", "appointment_enquiry"
+    consultation_data: Dict[str, Any]
+    phone: Optional[str] = None
+    name: Optional[str] = None
+    email: Optional[str] = None
 
 
-
-def create_inquiry_tool_factory(agent_instance):
-    """Factory function to create a create_inquiry tool bound to a specific agent instance"""
-    @function_tool()
-    async def create_inquiry(inquiry_type: str, inquiry_data: Dict[str, Any], phone: str | None = None, name: str | None = None):
-        """Create a real estate inquiry with the provided information."""
-        if agent_instance and agent_instance.inquiry_created:
-            return "I'm sorry, but I can only create one inquiry per call. Your previous inquiry has already been saved."
-
-        if agent_instance and agent_instance.caller_phone:
-            if not phone or phone == "unknown":
-                phone = agent_instance.caller_phone
-
-        try:
-            if not phone or phone == "unknown":
-                final_phone = f"call_{int(time.time())}"
-            else:
-                final_phone = phone
-
-            # Ensure inquiry_data is a plain dict
-            if inquiry_data and not isinstance(inquiry_data, dict):
-                if hasattr(inquiry_data, "model_dump"):
-                    inquiry_data = inquiry_data.model_dump()
-                elif hasattr(inquiry_data, "dict"):
-                    inquiry_data = inquiry_data.dict()
-                else:
-                    inquiry_data = dict(inquiry_data) if inquiry_data else {}
-
-            # Make database call non-blocking - don't wait for it
-            async def save_inquiry_async():
-                try:
-                    # 🔍 DEBUG: Agent calling save
-                    log.info(f"🔍 DEBUG: Agent save_inquiry_async starting...")
-                    log.info(f"🔍 DEBUG: Triggering database connection...")
-                    
-                    log.info(f"🔍 DEBUG: Inquiry data: {inquiry_data}")
-                    log.info(f"🔍 DEBUG: Inquiry type: {inquiry_type}")
-                    log.info(f"🔍 DEBUG: Phone: {final_phone}")
-                    
-                    # Get database driver (lazy initialization - this triggers DB connection)
-                    log.info("🔍 DEBUG: Getting database driver (will initialize connection if needed)...")
-                    driver = get_db_driver()
-                    log.info("🔍 DEBUG: Database driver obtained, calling create_inquiry...")
-                    
-                    result = driver.create_inquiry(
-                        final_phone, inquiry_type, inquiry_data, name, agent_instance.caller_phone
-                    )
-                    
-                    log.info(f"🔍 DEBUG: save result: {result is not None}")
-                    
-                    if result:
-                        agent_instance.inquiry_created = True
-                        log.info(f"✅ Inquiry saved to MongoDB with ID: {result.get('_id', 'N/A')}")
-                    else:
-                        log.warning("⚠️ Inquiry save returned None - may have failed")
-                except Exception as e:
-                    log.error(f"❌ Async inquiry save failed: {e}")
-                    import traceback
-                    log.error(f"🔍 DEBUG: Agent traceback: {traceback.format_exc()}")
-            
-            # Don't wait for database - respond immediately
-            asyncio.create_task(save_inquiry_async())
-
-            return "✅ Your inquiry has been saved successfully! One of our advisors will contact you shortly."
-        except Exception as e:
-            log.error(f"Inquiry creation failed: {e}")
-            return "Sorry, there was an error saving your inquiry. Please try again."
-
-    return create_inquiry
-
-
-# ------------------------------------------------------------
+# ============================================================
 # 🧠 AGENT CLASS
-# ------------------------------------------------------------
-class RealEstateAgent(Agent):
-    # Class-level cache (shared across all instances)
+# ============================================================
+
+class JewelleryConsultantAgent(Agent):
+    """Production-ready jewellery consultant agent with all safety guards"""
+    
+    # Class-level instruction cache
     _cached_instructions = None
     
-    def __init__(self, job_context=None):
-        # Use module-level cache to ensure prompts are loaded only once
-        # _get_combined_instructions() guarantees single computation
-        if RealEstateAgent._cached_instructions is None:
-            RealEstateAgent._cached_instructions = _get_combined_instructions()
+    def __init__(self, job_context=None, llm=None):
+        # Initialize instruction cache if not done
+        if JewelleryConsultantAgent._cached_instructions is None:
+            JewelleryConsultantAgent._cached_instructions = _get_combined_instructions()
         
-        create_inquiry_tool = create_inquiry_tool_factory(self)
-
+        # Initialize parent class
         super().__init__(
-            instructions=RealEstateAgent._cached_instructions,
-            tools=[create_inquiry_tool],
+            instructions=JewelleryConsultantAgent._cached_instructions,
+            tools=[self._create_consultation_tool()],  # Create tool inline
+            llm=llm,
         )
-
+        
+        # Instance state
         self.current_session = None
         self.caller_phone = None
         self.termination_started = False
-        self.inquiry_created = False
+        self.consultation_created = False
         self.job_context = job_context
-
-        global current_agent
-        current_agent = self
-
-    async def _execute_tool(self, tool_call, session):
-        if tool_call.function.name == "create_inquiry":
-            import json, time
-            args = json.loads(tool_call.function.arguments)
-            phone = self.caller_phone
-            if not phone or phone in ["unknown", "extracted_failed"]:
-                phone = f"call_{int(time.time())}"
-            args["phone"] = phone
+        self._active_tasks = set()  # Track async tasks for cleanup
+        
+        # Instance-level lock for per-call isolation
+        self._consultation_lock = asyncio.Lock()
+        
+        # Termination timer tracking
+        self._termination_timer_task: Optional[asyncio.Task] = None
+        self._termination_timeout = 60.0  # seconds of silence
+    
+    def _create_consultation_tool(self):
+        """Factory method to create consultation tool with proper locking"""
+        @function_tool()
+        async def create_consultation(
+            consultation_type: str, 
+            consultation_data: Dict[str, Any], 
+            phone: Optional[str] = None, 
+            name: Optional[str] = None, 
+            email: Optional[str] = None
+        ) -> str:
+            """
+            Create a jewellery consultation enquiry with the provided information.
+            Uses async lock to prevent double-triggering.
+            """
+            # Apply input sanitization to sensitive fields
+            if phone:
+                phone = sanitize_phone(phone)  # Phone-specific sanitization
+            if email:
+                email = sanitize_input(email)
+            if name:
+                name = sanitize_input(name)
             
-            # Ensure inquiry_data is a plain dict, not a Pydantic model
-            if "inquiry_data" in args and args["inquiry_data"]:
-                if hasattr(args["inquiry_data"], "model_dump"):
-                    # It's a Pydantic model, convert to dict
-                    args["inquiry_data"] = args["inquiry_data"].model_dump()
-                elif hasattr(args["inquiry_data"], "dict"):
-                    # Fallback for older Pydantic versions
-                    args["inquiry_data"] = args["inquiry_data"].dict()
-                elif not isinstance(args["inquiry_data"], dict):
-                    # Convert to dict if it's not already
-                    args["inquiry_data"] = dict(args["inquiry_data"])
-            
-            tool_call.function.arguments = json.dumps(args)
-        return await super()._execute_tool(tool_call, session)
-
-    async def on_message(self, message, session):
-        if self.termination_started:
-            return "The call is ending. Merci d'avoir contacté Immo Vallée ! Au revoir !"
+            # Use instance lock to prevent race conditions (per-call isolation)
+            async with self._consultation_lock:
+                if self.consultation_created:
+                    return "I'm sorry, but I can only create one consultation enquiry per call. Your previous enquiry has already been saved."
+                
+                # Use caller phone if available and no phone provided
+                if not phone or phone == "unknown":
+                    phone = self.caller_phone if self.caller_phone and self.caller_phone != "extracted_failed" else None
+                
+                # Generate fallback phone if none available
+                if not phone or phone == "unknown":
+                    phone = f"call_{int(time.time())}"
+                
+                # Ensure consultation_data is a plain dict
+                if consultation_data and not isinstance(consultation_data, dict):
+                    if hasattr(consultation_data, "model_dump"):
+                        consultation_data = consultation_data.model_dump()
+                    elif hasattr(consultation_data, "dict"):
+                        consultation_data = consultation_data.dict()
+                    else:
+                        consultation_data = dict(consultation_data) if consultation_data else {}
+                
+                # Sanitize consultation data
+                sanitized_data = {}
+                for key, value in consultation_data.items():
+                    if isinstance(value, str):
+                        sanitized_data[key] = sanitize_input(value)
+                    else:
+                        sanitized_data[key] = value
+                
+                # Create async task for non-blocking database write
+                async def save_consultation_async():
+                    try:
+                        driver = db_manager.get_driver()
+                        result = driver.create_consultation(
+                            phone, consultation_type, sanitized_data, name, email, self.caller_phone
+                        )
+                        
+                        if result:
+                            self.consultation_created = True
+                            log.info(f"✅ Consultation saved with ID: {result.get('_id', 'N/A')}")
+                        else:
+                            log.warning("⚠️ Consultation save returned None")
+                    except Exception as e:
+                        log.error(f"❌ Async consultation save failed: {e}")
+                
+                # Fire and forget - don't await
+                task = asyncio.create_task(save_consultation_async())
+                self._track_task(task)
+                
+                return "Thank you for your enquiry. I've saved your information, and one of our specialist consultants will follow up with you within 24 hours."
+        
+        return create_consultation
+    
+    def _track_task(self, task: asyncio.Task) -> None:
+        """Track async task for proper cleanup"""
+        self._active_tasks.add(task)
+        task.add_done_callback(lambda t: self._active_tasks.discard(t))
+    
+    def _reset_termination_timer(self):
+        """Reset or start the termination timer based on activity"""
+        # Cancel existing timer if running
+        if self._termination_timer_task and not self._termination_timer_task.done():
+            self._termination_timer_task.cancel()
+        
+        # Start new timer
+        self._termination_timer_task = asyncio.create_task(self._start_termination_timer())
+        self._track_task(self._termination_timer_task)
+    
+    async def _start_termination_timer(self):
+        """Internal method to start the termination timer"""
         try:
-            # Use reasonable timeout - balance between waiting and responsiveness
-            # If LLM is consistently slow, fallback will kick in
+            await asyncio.sleep(self._termination_timeout)
+            if not self.termination_started:
+                log.info(f"⏰ No activity for {self._termination_timeout}s, initiating termination")
+                await self._terminate_call_after_delay()
+        except asyncio.CancelledError:
+            # Timer was reset - that's expected
+            pass
+        except Exception as e:
+            log.error(f"Error in termination timer: {e}")
+    
+    async def _execute_tool(self, tool_call, session):
+        """Override tool execution with additional safety checks"""
+        try:
+            # Apply noise & intent guard before tool execution
+            if hasattr(tool_call.function, 'arguments'):
+                import json
+                args = json.loads(tool_call.function.arguments)
+                
+                # Check if this is a consultation creation
+                if tool_call.function.name == "create_consultation":
+                    # Sanitize phone number with phone-specific sanitization
+                    if "phone" in args and args["phone"]:
+                        args["phone"] = sanitize_phone(args["phone"])
+                    
+                    # Ensure we have a phone number
+                    if "phone" not in args or not args["phone"] or args["phone"] == "unknown":
+                        args["phone"] = self.caller_phone if self.caller_phone and self.caller_phone != "extracted_failed" else f"call_{int(time.time())}"
+                    
+                    # Convert consultation_data to dict if needed
+                    if "consultation_data" in args and args["consultation_data"]:
+                        data = args["consultation_data"]
+                        if hasattr(data, "model_dump"):
+                            args["consultation_data"] = data.model_dump()
+                        elif hasattr(data, "dict"):
+                            args["consultation_data"] = data.dict()
+                        elif not isinstance(data, dict):
+                            args["consultation_data"] = dict(data)
+                    
+                    tool_call.function.arguments = json.dumps(args)
+            
+            return await super()._execute_tool(tool_call, session)
+        except Exception as e:
+            log.error(f"Tool execution error: {e}")
+            return "I apologize, but there was an error processing your request."
+    
+    async def on_message(self, message, session):
+        """Handle incoming messages with all safety guards"""
+        if self.termination_started:
+            return "The call is ending. Thank you for contacting The Cornish Diamond Co. Goodbye!"
+        
+        # Extract text and confidence if available
+        text = message.content or ""
+        confidence = getattr(message, 'confidence', None)
+        
+        # Apply noise & intent guard
+        if not should_process(text, confidence):
+            log.debug(f"Filtered out message (confidence: {confidence}): {text[:50]}...")
+            return None  # Don't process irrelevant speech
+        
+        # Apply input sanitization
+        sanitized_text = sanitize_input(text)
+        if not sanitized_text:
+            return None
+        
+        # Use sanitized text
+        message.content = sanitized_text
+        
+        # Reset termination timer on valid activity
+        self._reset_termination_timer()
+        
+        try:
+            # Use timeout protection
             response = await asyncio.wait_for(
                 super().on_message(message, session),
-                timeout=3.0  # Optimized timeout - faster fallback for better UX
+                timeout=3.0
             )
             return response
         except asyncio.TimeoutError:
-            # Fallback immediately if LLM is slow - better UX than waiting
             log.warning("LLM response timeout, using fallback")
-            return self._get_smart_fallback_response(message.content or "")
+            return self._get_smart_fallback_response(text)
         except Exception as e:
             log.error(f"Error in on_message: {e}")
-            return self._get_smart_fallback_response(message.content or "")
-
-    def _get_smart_fallback_response(self, msg: str):
-        msg = msg.lower()
-        if any(x in msg for x in ['buy', 'acheter', 'purchase', 'property', 'bien', 'appartement', 'maison']):
-            return "I can help you find a property! What type of property are you looking for?"
-        if any(x in msg for x in ['sell', 'vendre', 'sale']):
-            return "I can help you sell your property! What type of property would you like to sell?"
-        if any(x in msg for x in ['estimate', 'estimation', 'value', 'prix']):
-            return "I can help you estimate your property! Where is your property located?"
-        if any(x in msg for x in ['hello', 'hi', 'hey', 'bonjour']):
-            return "Hello! Welcome to Immo Vallée. How can I help you today?"
-        return "I'm here to help you with your real estate needs. Are you looking to buy, sell, or estimate a property?"
-
+            return self._get_smart_fallback_response(text)
+    
+    def _get_smart_fallback_response(self, msg: str) -> str:
+        """Smart fallback responses based on intent keywords"""
+        msg_lower = msg.lower()
+        
+        if any(x in msg_lower for x in ['ring', 'engagement', 'wedding', 'band', 'diamond']):
+            return f"I can help you with information about our engagement rings, wedding bands, or diamond jewellery. What would you like to know?"
+        if any(x in msg_lower for x in ['appointment', 'consultation', 'book', 'visit']):
+            return f"I can help you arrange a consultation. Would you prefer an in-person or virtual consultation?"
+        if any(x in msg_lower for x in ['information', 'info', 'tell me', 'about']):
+            return f"I'd be happy to share information about our jewellery. Are you interested in engagement rings, wedding bands, or bespoke pieces?"
+        if any(x in msg_lower for x in ['hello', 'hi', 'hey']):
+            return f"Hello, and thank you for contacting {COMPANY_NAME}. My name is {AGENT_NAME}. How may I assist you today?"
+        
+        return f"I'm here to help you with information about our jewellery, guidance on choosing a ring, or to arrange an appointment. How may I assist you?"
+    
     async def on_start(self, session: AgentSession):
+        """Handle session start with greeting"""
         self.current_session = session
-        # Start greeting immediately - generate_reply returns a SpeechHandle, not a coroutine
-        # Don't await it - let it run in the background
-        try:
-            # Generate greeting (enabled by default, can be disabled with ENABLE_TTS=0)
-            if os.getenv("ENABLE_TTS", "1") != "0":
+        
+        # Start termination timer
+        self._reset_termination_timer()
+        
+        # Start greeting immediately (if TTS enabled)
+        if os.getenv("ENABLE_TTS", "1") != "0":
+            try:
                 session.generate_reply(
-                    instructions='Say the complete greeting in french: "Bonjour ! Merci de contacter Immo Vallée. Je suis Sarah, votre conseillère immobilière. Comment puis-je vous aider aujourd\'hui ?" Say all parts of the greeting - do not skip any words.'
+                    instructions=f'Say the complete greeting in English: "Hello, and thank you for contacting {COMPANY_NAME}. My name is {AGENT_NAME}. How may I assist you today?" Say all parts of the greeting - do not skip any words.'
                 )
-        except Exception as e:
-            log.warning(f"Greeting generation error: {e}, continuing anyway")
-
+            except Exception as e:
+                log.warning(f"Greeting generation error: {e}")
+    
+    async def cleanup(self):
+        """Cleanup all async tasks"""
+        # Cancel termination timer
+        if self._termination_timer_task and not self._termination_timer_task.done():
+            self._termination_timer_task.cancel()
+        
+        # Cancel all other tasks
+        for task in self._active_tasks:
+            if not task.done():
+                task.cancel()
+        
+        # Clear task sets
+        self._active_tasks.clear()
+        self._termination_timer_task = None
+    
     # ------------------------------------------------------------
-    # 🧩 FULL TERMINATION SEQUENCE
+    # 🧩 TERMINATION LOGIC (FIXED - ASYNC TWILIO CALLS)
     # ------------------------------------------------------------
+    
+    async def _terminate_twilio_call(self, call_sid: str) -> None:
+        """Terminate Twilio call using REST API - ASYNCHRONOUS fire-and-forget"""
+        import aiohttp
+        
+        account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+        auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+        
+        if not account_sid or not auth_token:
+            log.warning("⚠️ Twilio credentials missing")
+            return
+        
+        async def terminate_async():
+            try:
+                url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Calls/{call_sid}.json"
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        url,
+                        auth=aiohttp.BasicAuth(account_sid, auth_token),
+                        data={"Status": "completed"},
+                        timeout=5.0
+                    ) as resp:
+                        if resp.status == 200:
+                            log.info(f"✅ Twilio call {call_sid} terminated")
+                        else:
+                            body = await resp.text()
+                            log.warning(f"⚠️ Twilio API failed: {resp.status} - {body}")
+            except Exception as e:
+                log.error(f"⚠️ Error terminating Twilio call: {e}")
+        
+        # Fire and forget - don't await
+        task = asyncio.create_task(terminate_async())
+        self._track_task(task)
+    
     async def _terminate_call_after_delay(self):
-        """Comprehensive call termination logic"""
-        job_context = self.job_context
+        """Comprehensive async termination sequence"""
         try:
             log.info("🔧 Starting automatic call termination sequence...")
-            await asyncio.sleep(5.0)
             self.termination_started = True
-
-            if self.current_session:
+            
+            # Cancel termination timer
+            if self._termination_timer_task and not self._termination_timer_task.done():
+                self._termination_timer_task.cancel()
+            
+            # Send goodbye message
+            if self.current_session and os.getenv("ENABLE_TTS", "1") != "0":
                 try:
-                    if os.getenv("ENABLE_TTS", "1") != "0":
-                        await asyncio.wait_for(
-                            self.current_session.generate_reply(
-                                instructions="Say: Merci d'avoir contacté Immo Vallée ! Au revoir !"
-                            ),
-                            timeout=4.0
-                        )
+                    await asyncio.wait_for(
+                        self.current_session.generate_reply(
+                            instructions=f"Say: Thank you for contacting {COMPANY_NAME}. Goodbye!"
+                        ),
+                        timeout=4.0
+                    )
                     await asyncio.sleep(6.0)
                 except Exception as e:
                     log.warning(f"⚠️ Could not send final goodbye: {e}")
-
-                # 1️⃣ Disconnect all participants
-                try:
-                    if hasattr(self.current_session, "room") and self.current_session.room:
-                        for pid, p in self.current_session.room.remote_participants.items():
-                            try:
-                                await p.disconnect()
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-
-                # 2️⃣ Close room
-                try:
-                    if hasattr(self.current_session, "room") and self.current_session.room:
-                        await self.current_session.room.close()
-                except Exception:
-                    pass
-
-                # 3️⃣ Session termination variants
-                for method_name in ["disconnect", "stop", "end", "close", "terminate", "shutdown"]:
-                    if hasattr(self.current_session, method_name):
-                        try:
-                            await getattr(self.current_session, method_name)()
-                            break
-                        except Exception:
-                            continue
-
-                # 4️⃣ Close _room
-                try:
-                    if hasattr(self.current_session, "_room") and self.current_session._room:
-                        await self.current_session._room.close()
-                except Exception:
-                    pass
-
-                # 5️⃣ Stop agent
-                try:
-                    if hasattr(self.current_session, "agent") and self.current_session.agent:
-                        if hasattr(self.current_session.agent, "stop"):
-                            await self.current_session.agent.stop()
-                except Exception:
-                    pass
-
-                # 6️⃣ Force disconnect SIP participants
-                try:
-                    if job_context and hasattr(job_context, "room") and job_context.room:
-                        for pid, participant in job_context.room.remote_participants.items():
-                            if pid.startswith("sip_"):
-                                for m in ["disconnect", "remove", "kick"]:
-                                    if hasattr(participant, m):
-                                        try:
-                                            await getattr(participant, m)()
-                                        except Exception:
-                                            pass
-                except Exception:
-                    pass
-
-                # 7️⃣ room.disconnect_participant
-                try:
-                    if job_context and hasattr(job_context, "room") and job_context.room:
-                        for pid in job_context.room.remote_participants.keys():
-                            if hasattr(job_context.room, "disconnect_participant"):
-                                await job_context.room.disconnect_participant(pid)
-                except Exception:
-                    pass
-
-                # 8️⃣ room.remove_participant
-                try:
-                    if job_context and hasattr(job_context, "room") and job_context.room:
-                        for pid in job_context.room.remote_participants.keys():
-                            if hasattr(job_context.room, "remove_participant"):
-                                await job_context.room.remove_participant(pid)
-                except Exception:
-                    pass
-
-                # 9️⃣ Close connection
-                try:
-                    if job_context and hasattr(job_context, "room") and job_context.room:
-                        room = job_context.room
-                        if hasattr(room, "connection"):
-                            conn = room.connection
-                            if hasattr(conn, "close"):
-                                await conn.close()
-                        elif hasattr(room, "_connection"):
-                            conn = room._connection
-                            if hasattr(conn, "close"):
-                                await conn.close()
-                except Exception:
-                    pass
-
-                # 🔟 Terminate Twilio call via API
-                try:
-                    if job_context and hasattr(job_context, "room") and job_context.room:
-                        room = job_context.room
-                        for pid, participant in room.remote_participants.items():
-                            if pid.startswith("sip_"):
-                                if hasattr(participant, "attributes") and participant.attributes:
-                                    call_sid = participant.attributes.get("sip.twilio.callSid")
-                                    if call_sid:
-                                        log.info(f"🔧 Terminating Twilio call SID: {call_sid}")
-                                        await self._terminate_twilio_call(call_sid)
-                except Exception as e:
-                    log.warning(f"⚠️ Twilio termination failed: {e}")
-
-                # 11️⃣ Disconnect job context
-                try:
-                    if hasattr(job_context, "disconnect"):
-                        await job_context.disconnect()
-                except Exception:
-                    pass
-
-                # 12️⃣ Clear session reference
-                self.current_session = None
-                log.info("✅ Call termination sequence completed successfully.")
+            
+            # Terminate Twilio calls asynchronously
+            if self.job_context and hasattr(self.job_context, "room"):
+                room = self.job_context.room
+                for pid, participant in room.remote_participants.items():
+                    if pid.startswith("sip_"):
+                        if hasattr(participant, "attributes") and participant.attributes:
+                            call_sid = participant.attributes.get("sip.twilio.callSid")
+                            if call_sid:
+                                log.info(f"🔧 Scheduling Twilio termination for SID: {call_sid}")
+                                # Fire and forget - don't await
+                                asyncio.create_task(self._terminate_twilio_call(call_sid))
+            
+            # Cleanup tasks
+            await self.cleanup()
+            
+            log.info("✅ Call termination sequence completed")
+            
         except Exception as e:
-            log.error(f"⚠️ Error in _terminate_call_after_delay: {e}")
-
-    async def _terminate_twilio_call(self, call_sid: str):
-        """Terminate Twilio call using Twilio REST API"""
-        import aiohttp
-
-        account_sid = os.getenv("TWILIO_ACCOUNT_SID")
-        auth_token = os.getenv("TWILIO_AUTH_TOKEN")
-
-        if not account_sid or not auth_token:
-            log.warning("⚠️ Twilio credentials missing.")
-            return
-
-        try:
-            url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Calls/{call_sid}.json"
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    url,
-                    auth=aiohttp.BasicAuth(account_sid, auth_token),
-                    data={"Status": "completed"},
-                ) as resp:
-                    if resp.status == 200:
-                        log.info(f"✅ Twilio call {call_sid} terminated.")
-                    else:
-                        body = await resp.text()
-                        log.warning(f"⚠️ Twilio API failed: {resp.status} - {body}")
-        except Exception as e:
-            log.error(f"⚠️ Error terminating Twilio call: {e}")
+            log.error(f"⚠️ Error in termination sequence: {e}")
+            # Don't re-raise to avoid breaking the async flow
 
 
-# ------------------------------------------------------------
+# ============================================================
 # 🚀 ENTRYPOINT
-# ------------------------------------------------------------
+# ============================================================
+
 async def entrypoint(ctx: JobContext):
-    global current_job_context
-    current_job_context = ctx
-
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-    if not openai_api_key:
-        raise RuntimeError("Missing OPENAI_API_KEY in environment variables!")
-
-    # 🚀 REALTIME MODEL: Ultra-low latency - STT + LLM + TTS all in one!
-    # No separate Deepgram, no separate TTS, no separate LLM
-    # Everything happens in real-time with OpenAI's Realtime API
+    """Main entrypoint with health checks and proper initialization"""
     
-    # Configure turn detection - use Pydantic model if available, otherwise use dict
-    if HAS_SERVER_VAD:
-        turn_detection_config = ServerVAD(
-            threshold=0.5,
-            prefix_padding_ms=300,
-            silence_duration_ms=500,
-        )
-    else:
-        # Fallback: create a Pydantic model dynamically if ServerVAD not available
-        class ServerVADConfig(BaseModel):
-            type: str = "server_vad"
-            threshold: float = 0.5
-            prefix_padding_ms: int = 300
-            silence_duration_ms: int = 500
-        
-        turn_detection_config = ServerVADConfig()
+    # 1. Environment validation
+    required_vars = ["OPENAI_API_KEY", "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN"]
+    missing_vars = [var for var in required_vars if not os.getenv(var)]
+    if missing_vars:
+        raise RuntimeError(f"Missing required environment variables: {missing_vars}")
     
+    # 2. Initialize database with health check
+    try:
+        await db_manager.initialize()
+    except Exception as e:
+        log.error(f"❌ Database initialization failed: {e}")
+        raise
+    
+    # 3. Create RealtimeModel with configurable parameters
     realtime_model = realtime.RealtimeModel(
-        api_key=openai_api_key,
-        model="gpt-4o-mini-realtime-preview-2024-12-17",
-        voice="alloy",
+        api_key=os.getenv("OPENAI_API_KEY"),
+        model=OPENAI_MODEL,  # Configurable via env var
+        voice=AGENT_VOICE,   # Configurable via env var
         modalities=["audio", "text"],
-        turn_detection=turn_detection_config,
     )
-
-
-    # Create Agent with RealtimeModel (no separate STT/TTS/LLM needed)
-    agent = RealEstateAgent(job_context=ctx)
     
-    # Override agent's LLM with RealtimeModel
-    agent._llm = realtime_model
+    # 4. Create agent
+    agent = JewelleryConsultantAgent(
+        job_context=ctx,
+        llm=realtime_model
+    )
     
-    # Create AgentSession (RealtimeModel handles everything)
+    # 5. Create session
     session = AgentSession(
-        stt=None,  # RealtimeModel handles STT
-        tts=None,  # RealtimeModel handles TTS
-        llm=realtime_model,  # RealtimeModel handles LLM
+        stt=None,  # Handled by RealtimeModel
+        tts=None,  # Handled by RealtimeModel
+        llm=realtime_model,
     )
     
+    # 6. Connect to room
     await ctx.connect()
-
-    # Extract caller phone number (non-blocking - done in parallel with session start)
+    
+    # 7. Extract caller phone number (non-blocking)
     async def extract_phone_number():
         caller_phone = None
         try:
-            # Try immediately first
-            room = ctx.room
-            if room:
-                for pid, participant in room.remote_participants.items():
+            if ctx.room:
+                for pid, participant in ctx.room.remote_participants.items():
+                    # Try different attribute locations
                     if pid.startswith("sip_"):
                         phone = pid.replace("sip_", "")
                         if phone.startswith("+"):
                             caller_phone = phone
                             break
-                    if hasattr(participant, "attributes") and participant.attributes:
-                        sip_phone = participant.attributes.get("sip.phoneNumber")
+                    
+                    attrs = getattr(participant, "attributes", None)
+                    if attrs:
+                        sip_phone = attrs.get("sip.phoneNumber") or attrs.get("sip.twilio.callerNumber")
                         if sip_phone:
                             caller_phone = sip_phone
                             break
-                    if hasattr(participant, "metadata") and participant.metadata:
-                        phone_metadata = participant.metadata.get("phoneNumber") or participant.metadata.get("from")
+                    
+                    metadata = getattr(participant, "metadata", None)
+                    if metadata:
+                        phone_metadata = metadata.get("phoneNumber") or metadata.get("from")
                         if phone_metadata:
                             caller_phone = phone_metadata
                             break
             
-            # If not found, wait briefly and try again (but don't block session start)
+            # Try again after brief delay if not found
             if not caller_phone:
                 await asyncio.sleep(0.3)
-                room = ctx.room
-                if room:
-                    for pid, participant in room.remote_participants.items():
+                if ctx.room:
+                    for pid in ctx.room.remote_participants.keys():
                         if pid.startswith("sip_"):
                             phone = pid.replace("sip_", "")
                             if phone.startswith("+"):
                                 caller_phone = phone
                                 break
-                        if hasattr(participant, "attributes") and participant.attributes:
-                            sip_phone = participant.attributes.get("sip.phoneNumber")
-                            if sip_phone:
-                                caller_phone = sip_phone
-                                break
-                        if hasattr(participant, "metadata") and participant.metadata:
-                            phone_metadata = participant.metadata.get("phoneNumber") or participant.metadata.get("from")
-                            if phone_metadata:
-                                caller_phone = phone_metadata
-                                break
-        except Exception:
-            pass
         
-        if caller_phone:
-            agent.caller_phone = caller_phone
-        else:
-            agent.caller_phone = "extracted_failed"
-
-    # Start session immediately without blocking
+        except Exception as e:
+            log.warning(f"Phone extraction failed: {e}")
+        
+        agent.caller_phone = sanitize_phone(caller_phone) if caller_phone else "extracted_failed"
+        log.info(f"📞 Extracted caller phone: {agent.caller_phone}")
+    
+    # 8. Start session with noise cancellation
     await session.start(
         room=ctx.room,
         agent=agent,
@@ -564,18 +659,18 @@ async def entrypoint(ctx: JobContext):
             noise_cancellation=noise_cancellation.BVC(),
         ),
     )
-
-    # Extract phone number in parallel (non-blocking)
-    asyncio.create_task(extract_phone_number())
     
-    # Start greeting immediately
+    # 9. Run phone extraction and greeting in parallel
+    asyncio.create_task(extract_phone_number())
     asyncio.create_task(agent.on_start(session))
 
 
-# ------------------------------------------------------------
+# ============================================================
 # 🏁 MAIN RUNNER
-# ------------------------------------------------------------
+# ============================================================
+
 if __name__ == "__main__":
+    # Run the agent
     agents.cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
